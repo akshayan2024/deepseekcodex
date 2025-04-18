@@ -18,9 +18,9 @@ import { AgentLoop } from "../../utils/agent/agent-loop.js";
 import { isLoggingEnabled, log } from "../../utils/agent/log.js";
 import { ReviewDecision } from "../../utils/agent/review.js";
 import { generateCompactSummary } from "../../utils/compact-summary.js";
-import { OPENAI_BASE_URL } from "../../utils/config.js";
+import { DEEPSEEK_API_URL } from "../../utils/config.js";
 import { createInputItem } from "../../utils/input-utils.js";
-import { getAvailableModels } from "../../utils/model-utils.js";
+import { getAvailableModels, mapToDeepSeekModel } from "../../utils/model-utils.js";
 import { CLI_VERSION } from "../../utils/session.js";
 import { shortCwd } from "../../utils/short-path.js";
 import { saveRollout } from "../../utils/storage/save-rollout.js";
@@ -50,7 +50,7 @@ const colorsByPolicy: Record<ApprovalPolicy, ColorName | undefined> = {
 };
 
 /**
- * Generates an explanation for a shell command using the OpenAI API.
+ * Generates an explanation for a shell command using the DeepSeek API.
  *
  * @param command The command to explain
  * @param model The model to use for generating the explanation
@@ -63,16 +63,19 @@ async function generateCommandExplanation(
   try {
     // Create a temporary OpenAI client
     const oai = new OpenAI({
-      apiKey: process.env["OPENAI_API_KEY"],
-      baseURL: OPENAI_BASE_URL,
+      apiKey: process.env["DEEPSEEK_API_KEY"],
+      baseURL: DEEPSEEK_API_URL,
     });
+
+    // Map the model name to DeepSeek equivalent
+    const mappedModel = mapToDeepSeekModel(model);
 
     // Format the command for display
     const commandForDisplay = formatCommandForDisplay(command);
 
     // Create a prompt that asks for an explanation with a more detailed system prompt
     const response = await oai.chat.completions.create({
-      model,
+      model: mappedModel,
       messages: [
         {
           role: "system",
@@ -111,7 +114,7 @@ async function generateCommandExplanation(
             "Unable to generate explanation: Rate limit exceeded. Please try again later.";
         } else if (error.status >= 500) {
           errorMessage =
-            "Unable to generate explanation: OpenAI service is currently unavailable. Please try again later.";
+            "Unable to generate explanation: DeepSeek service is currently unavailable. Please try again later.";
         }
       }
     }

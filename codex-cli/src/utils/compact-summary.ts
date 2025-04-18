@@ -1,60 +1,76 @@
 import type { ResponseItem } from "openai/resources/responses/responses.mjs";
 
-import { OPENAI_BASE_URL } from "./config.js";
+import { DEEPSEEK_API_URL } from "./config.js";
 import OpenAI from "openai";
+import { mapToDeepSeekModel } from "./model-utils.js";
 
 /**
- * Generate a condensed summary of the conversation items.
- * @param items The list of conversation items to summarize
- * @param model The model to use for generating the summary
- * @returns A concise structured summary string
+ * Generate a compact summary of conversation history with the DeepSeek API.
+ * @param items Conversation history items
+ * @param model The model to use for summarization
+ * @returns A concise summary of the conversation history
  */
 export async function generateCompactSummary(
   items: Array<ResponseItem>,
   model: string,
 ): Promise<string> {
   const oai = new OpenAI({
-    apiKey: process.env["OPENAI_API_KEY"],
-    baseURL: OPENAI_BASE_URL,
+    apiKey: process.env["DEEPSEEK_API_KEY"],
+    baseURL: DEEPSEEK_API_URL,
   });
 
-  const conversationText = items
-    .filter(
-      (
-        item,
-      ): item is ResponseItem & { content: Array<unknown>; role: string } =>
-        item.type === "message" &&
-        (item.role === "user" || item.role === "assistant") &&
-        Array.isArray(item.content),
-    )
-    .map((item) => {
-      const text = item.content
-        .filter(
-          (part): part is { text: string } =>
-            typeof part === "object" &&
-            part != null &&
-            "text" in part &&
-            typeof (part as { text: unknown }).text === "string",
-        )
-        .map((part) => part.text)
-        .join("");
-      return `${item.role}: ${text}`;
-    })
-    .join("\n");
+  // Map model name to DeepSeek equivalent
+  const mappedModel = mapToDeepSeekModel(model);
 
+  // Extract text from the items
+  const messages = items
+    .map((item) => {
+      if (
+        item.type === "message" &&
+        item.content &&
+        Array.isArray(item.content)
+      ) {
+        // Handle standard text content
+        const textContent = item.content
+          .map((c) => {
+            if (
+              "type" in c &&
+              (c.type === "input_text" || c.type === "output_text") &&
+              "text" in c &&
+              typeof c.text === "string"
+            ) {
+              return c.text;
+            }
+            return null;
+          })
+          .filter(Boolean)
+          .join("\n");
+
+        if (textContent.trim()) {
+          return `${item.role}: ${textContent}`;
+        }
+      }
+      return null;
+    })
+    .filter(Boolean)
+    .join("\n\n");
+
+  // Create a summary prompt
   const response = await oai.chat.completions.create({
-    model,
+    model: mappedModel,
     messages: [
       {
-        role: "assistant",
+        role: "system",
         content:
-          "You are an expert coding assistant. Your goal is to generate a concise, structured summary of the conversation below that captures all essential information needed to continue development after context replacement. Include tasks performed, code areas modified or reviewed, key decisions or assumptions, test results or errors, and outstanding tasks or next steps.",
+          "You are a helpful assistant that summarizes conversation history into a concise form. Extract the main points, key decisions, and current status of the task.",
       },
       {
         role: "user",
-        content: `Here is the conversation so far:\n${conversationText}\n\nPlease summarize this conversation, covering:\n1. Tasks performed and outcomes\n2. Code files, modules, or functions modified or examined\n3. Important decisions or assumptions made\n4. Errors encountered and test or build results\n5. Remaining tasks, open questions, or next steps\nProvide the summary in a clear, concise format.`,
+        content: `Here is the conversation history, please create a concise summary that captures the key points and current status. Focus on the most important information only:\n\n${messages}`,
       },
     ],
   });
-  return response.choices[0]?.message.content ?? "Unable to generate summary.";
+
+  const summary = response.choices[0]?.message.content || messages;
+  return summary;
 }

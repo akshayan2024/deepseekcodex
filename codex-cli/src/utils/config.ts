@@ -15,8 +15,9 @@ import { load as loadYaml, dump as dumpYaml } from "js-yaml";
 import { homedir } from "os";
 import { dirname, join, extname, resolve as resolvePath } from "path";
 
-export const DEFAULT_AGENTIC_MODEL = "o4-mini";
-export const DEFAULT_FULL_CONTEXT_MODEL = "gpt-4.1";
+// Updated model defaults for DeepSeek
+export const DEFAULT_AGENTIC_MODEL = "deepseek-chat";
+export const DEFAULT_FULL_CONTEXT_MODEL = "deepseek-chat";
 export const DEFAULT_APPROVAL_MODE = AutoApprovalMode.SUGGEST;
 export const DEFAULT_INSTRUCTIONS = "";
 
@@ -31,13 +32,15 @@ export const CONFIG_YML_FILEPATH = join(CONFIG_DIR, "config.yml");
 export const CONFIG_FILEPATH = CONFIG_JSON_FILEPATH;
 export const INSTRUCTIONS_FILEPATH = join(CONFIG_DIR, "instructions.md");
 
-export const OPENAI_TIMEOUT_MS =
-  parseInt(process.env["OPENAI_TIMEOUT_MS"] || "0", 10) || undefined;
-export const OPENAI_BASE_URL = process.env["OPENAI_BASE_URL"] || "";
-export let OPENAI_API_KEY = process.env["OPENAI_API_KEY"] || "";
+export const DEEPSEEK_TIMEOUT_MS =
+  parseInt(process.env["DEEPSEEK_TIMEOUT_MS"] || process.env["OPENAI_TIMEOUT_MS"] || "0", 10) || undefined;
+
+// Updated to use DeepSeek API endpoints and keys
+export const DEEPSEEK_API_URL = process.env["DEEPSEEK_API_URL"] || "https://api.deepseek.com";
+export let DEEPSEEK_API_KEY = process.env["DEEPSEEK_API_KEY"] || "";
 
 export function setApiKey(apiKey: string): void {
-  OPENAI_API_KEY = apiKey;
+  DEEPSEEK_API_KEY = apiKey;
 }
 
 // Formatting (quiet mode-only).
@@ -63,7 +66,7 @@ export type StoredConfig = {
 // propagating to existing users until they explicitly set a model.
 export const EMPTY_STORED_CONFIG: StoredConfig = { model: "" };
 
-// Pre‑stringified JSON variant so we don’t stringify repeatedly.
+// Pre‑stringified JSON variant so we don't stringify repeatedly.
 const EMPTY_CONFIG_JSON = JSON.stringify(EMPTY_STORED_CONFIG, null, 2) + "\n";
 
 export type MemoryConfig = {

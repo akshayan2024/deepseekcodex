@@ -218,17 +218,15 @@ if (cli.flags.config) {
 // API key handling
 // ---------------------------------------------------------------------------
 
-const apiKey = process.env["OPENAI_API_KEY"];
+const apiKey = process.env["DEEPSEEK_API_KEY"];
 
 if (!apiKey) {
   // eslint-disable-next-line no-console
   console.error(
-    `\n${chalk.red("Missing OpenAI API key.")}\n\n` +
-      `Set the environment variable ${chalk.bold("OPENAI_API_KEY")} ` +
+    `\n${chalk.red("Missing DeepSeek API key.")}\n\n` +
+      `Set the environment variable ${chalk.bold("DEEPSEEK_API_KEY")} ` +
       `and re-run this command.\n` +
-      `You can create a key here: ${chalk.bold(
-        chalk.underline("https://platform.openai.com/account/api-keys"),
-      )}\n`,
+      `You can obtain a DeepSeek key from the DeepSeek platform.\n`,
   );
   process.exit(1);
 }
@@ -256,9 +254,9 @@ if (!(await isModelSupportedForResponses(config.model))) {
   // eslint-disable-next-line no-console
   console.error(
     `The model "${config.model}" does not appear in the list of models ` +
-      `available to your account. Double‑check the spelling (use\n` +
-      `  openai models list\n` +
-      `to see the full list) or choose another model with the --model flag.`,
+      `available to your account. Double‑check the spelling or ` +
+      `choose another model with the --model flag.\n` +
+      `Available DeepSeek models: deepseek-chat, deepseek-coder, deepseek-reasoner`
   );
   process.exit(1);
 }

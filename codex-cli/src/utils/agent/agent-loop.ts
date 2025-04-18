@@ -6,11 +6,13 @@ import type {
   ResponseInputItem,
   ResponseItem,
 } from "openai/resources/responses/responses.mjs";
+import type { ChatCompletionChunk } from "openai/resources/chat/completions";
 import type { Reasoning } from "openai/resources.mjs";
 
 import { log, isLoggingEnabled } from "./log.js";
-import { OPENAI_BASE_URL, OPENAI_TIMEOUT_MS } from "../config.js";
+import { DEEPSEEK_API_URL, DEEPSEEK_TIMEOUT_MS } from "../config.js";
 import { parseToolCallArguments } from "../parsers.js";
+import { mapToDeepSeekModel } from "../model-utils.js";
 import {
   ORIGIN,
   CLI_VERSION,
@@ -21,6 +23,7 @@ import {
 import { handleExecCommand } from "./handle-exec-command.js";
 import { randomUUID } from "node:crypto";
 import OpenAI, { APIConnectionTimeoutError } from "openai";
+import { DebugLogger } from "../debug-logger.js";
 
 // Wait time before retrying after rate limit errors (ms).
 const RATE_LIMIT_RETRY_WAIT_MS = parseInt(
@@ -219,7 +222,8 @@ export class AgentLoop {
     onLastResponseId,
     additionalWritableRoots,
   }: AgentLoopParams & { config?: AppConfig }) {
-    this.model = model;
+    // Map OpenAI model name to DeepSeek equivalent
+    this.model = mapToDeepSeekModel(model);
     this.instructions = instructions;
     this.approvalPolicy = approvalPolicy;
 
@@ -241,8 +245,8 @@ export class AgentLoop {
     this.onLastResponseId = onLastResponseId;
     this.sessionId = getSessionId() || randomUUID().replaceAll("-", "");
     // Configure OpenAI client with optional timeout (ms) from environment
-    const timeoutMs = OPENAI_TIMEOUT_MS;
-    const apiKey = this.config.apiKey ?? process.env["OPENAI_API_KEY"] ?? "";
+    const timeoutMs = DEEPSEEK_TIMEOUT_MS;
+    const apiKey = this.config.apiKey ?? process.env["DEEPSEEK_API_KEY"] ?? "";
     this.oai = new OpenAI({
       // The OpenAI JS SDK only requires `apiKey` when making requests against
       // the official API.  When running unit‑tests we stub out all network
@@ -251,7 +255,7 @@ export class AgentLoop {
       // errors inside the SDK (it validates that `apiKey` is a non‑empty
       // string when the field is present).
       ...(apiKey ? { apiKey } : {}),
-      baseURL: OPENAI_BASE_URL,
+      baseURL: DEEPSEEK_API_URL,
       defaultHeaders: {
         originator: ORIGIN,
         version: CLI_VERSION,
@@ -312,7 +316,7 @@ export class AgentLoop {
     // endpoint) or `id` (chat endpoint).  Prefer `call_id` if present but fall
     // back to `id` to remain compatible.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const callId: string = (item as any).call_id ?? (item as any).id;
+    const callId: string = (item as any).call_id ?? (item as any).id ?? `tool-${Date.now()}-${Math.random().toString().substring(2, 8)}`;
 
     const args = parseToolCallArguments(rawArguments ?? "{}");
     if (isLoggingEnabled()) {
@@ -326,7 +330,7 @@ export class AgentLoop {
     if (args == null) {
       const outputItem: ResponseInputItem.FunctionCallOutput = {
         type: "function_call_output",
-        call_id: item.call_id,
+        call_id: callId,
         output: `invalid arguments: ${rawArguments}`,
       };
       return [outputItem];
@@ -368,11 +372,29 @@ export class AgentLoop {
         this.getCommandConfirmation,
         this.execAbortController?.signal,
       );
+      
+      // Add debug analysis for command output before JSON stringification
+      if (process.env["DEBUG"]) {
+        // Log detailed information about the command output
+        DebugLogger.analyzeToolCallOutput(
+          name || "shell", 
+          rawArguments || "", 
+          outputText
+        );
+      }
+      
       outputItem.output = JSON.stringify({ output: outputText, metadata });
 
       if (additionalItemsFromExec) {
         additionalItems.push(...additionalItemsFromExec);
       }
+    }
+
+    // Remove all problematic debug code sections with linter errors
+    if (process.env["DEBUG"]) {
+      // Log the final JSON output being returned to check for potential issues
+      log(`Function call final output length: ${outputItem.output.length} characters`);
+      DebugLogger.logJsonParseAttempt(outputItem.output, true);
     }
 
     return [outputItem, ...additionalItems];
@@ -394,8 +416,13 @@ export class AgentLoop {
       if (this.terminated) {
         throw new Error("AgentLoop has been terminated");
       }
+
       // Record when we start "thinking" so we can report accurate elapsed time.
       const thinkingStart = Date.now();
+
+      // Immediately signal that we're working on the response.
+      this.onLoading(true);
+
       // Bump generation so that any late events from previous runs can be
       // identified and dropped.
       const thisGeneration = ++this.generation;
@@ -476,16 +503,46 @@ export class AgentLoop {
         }, 10);
       };
 
+      // Text buffer implementation for accumulating content
+      let textBuffer = "";
+      let currentMessageId = "";
+      let lastFlushTime = Date.now();
+      const flushTextBuffer = () => {
+        if (textBuffer.length === 0) return;
+        
+        // Create a message item with the accumulated text
+        const messageItem: any = {
+          id: currentMessageId || `msg-${Date.now()}-${Math.random().toString().substring(2, 8)}`,
+          type: "message",
+          role: "assistant",
+          status: "done",
+          content: [{
+            type: "output_text",
+            text: textBuffer,
+            annotations: []
+          }]
+        };
+        
+        // Set or update the current message ID for consistency
+        currentMessageId = messageItem.id;
+        
+        // Stage the item
+        stageItem(messageItem);
+        textBuffer = "";
+        lastFlushTime = Date.now();
+      };
+
       while (turnInput.length > 0) {
         if (this.canceled || this.hardAbort.signal.aborted) {
           this.onLoading(false);
           return;
         }
+        // send request to DeepSeek chat API
         // send request to openAI
         for (const item of turnInput) {
           stageItem(item as ResponseItem);
         }
-        // Send request to OpenAI with retry on timeout
+        // Send request to DeepSeek with chat completions API
         let stream;
 
         // Retry loop for transient errors. Up to MAX_RETRIES attempts.
@@ -508,40 +565,42 @@ export class AgentLoop {
                 `instructions (length ${mergedInstructions.length}): ${mergedInstructions}`,
               );
             }
+
+            // Convert inputs to messages format for chat API
+            const messages = this.convertInputToMessages(turnInput, mergedInstructions);
+
             // eslint-disable-next-line no-await-in-loop
-            stream = await this.oai.responses.create({
+            stream = await this.oai.chat.completions.create({
               model: this.model,
-              instructions: mergedInstructions,
-              previous_response_id: lastResponseId || undefined,
-              input: turnInput,
+              messages: messages,
               stream: true,
-              parallel_tool_calls: false,
-              reasoning,
               tools: [
                 {
                   type: "function",
-                  name: "shell",
-                  description: "Runs a shell command, and returns its output.",
-                  strict: false,
-                  parameters: {
-                    type: "object",
-                    properties: {
-                      command: { type: "array", items: { type: "string" } },
-                      workdir: {
-                        type: "string",
-                        description: "The working directory for the command.",
+                  function: {
+                    name: "shell",
+                    description: "Runs a shell command, and returns its output.",
+                    parameters: {
+                      type: "object",
+                      properties: {
+                        command: { type: "array", items: { type: "string" } },
+                        workdir: {
+                          type: "string",
+                          description: "The working directory for the command.",
+                        },
+                        timeout: {
+                          type: "number",
+                          description:
+                            "The maximum time to wait for the command to complete in milliseconds.",
+                        },
                       },
-                      timeout: {
-                        type: "number",
-                        description:
-                          "The maximum time to wait for the command to complete in milliseconds.",
-                      },
-                    },
-                    required: ["command"],
-                    additionalProperties: false,
-                  },
+                      required: ["command"],
+                      additionalProperties: false,
+                    }
+                  }
                 },
               ],
+              tool_choice: "auto"
             });
             break;
           } catch (error) {
@@ -567,7 +626,7 @@ export class AgentLoop {
               attempt < MAX_RETRIES
             ) {
               log(
-                `OpenAI request failed (attempt ${attempt}/${MAX_RETRIES}), retrying...`,
+                `DeepSeek request failed (attempt ${attempt}/${MAX_RETRIES}), retrying...`,
               );
               continue;
             }
@@ -615,7 +674,7 @@ export class AgentLoop {
                   }
                 }
                 log(
-                  `OpenAI rate limit exceeded (attempt ${attempt}/${MAX_RETRIES}), retrying in ${Math.round(
+                  `DeepSeek rate limit exceeded (attempt ${attempt}/${MAX_RETRIES}), retrying in ${Math.round(
                     delayMs,
                   )} ms...`,
                 );
@@ -690,7 +749,7 @@ export class AgentLoop {
                         `Message: ${errCtx.message || "unknown"}`,
                       ].join(", ");
 
-                      return `⚠️  OpenAI rejected the request${
+                      return `⚠️  DeepSeek rejected the request${
                         reqId ? ` (request ID: ${reqId})` : ""
                       }. Error details: ${errorDetails}. Please verify your settings and try again.`;
                     })(),
@@ -732,52 +791,90 @@ export class AgentLoop {
 
         try {
           // eslint-disable-next-line no-await-in-loop
-          for await (const event of stream) {
+          for await (const chunk of stream) {
             if (isLoggingEnabled()) {
-              log(`AgentLoop.run(): response event ${event.type}`);
+              log(`AgentLoop.run(): received chat completion chunk`);
             }
 
-            // process and surface each item (no‑op until we can depend on streaming events)
-            if (event.type === "response.output_item.done") {
-              const item = event.item;
-              // 1) if it's a reasoning item, annotate it
-              type ReasoningItem = { type?: string; duration_ms?: number };
-              const maybeReasoning = item as ReasoningItem;
-              if (maybeReasoning.type === "reasoning") {
-                maybeReasoning.duration_ms = Date.now() - thinkingStart;
-              }
-              if (item.type === "function_call") {
-                // Track outstanding tool call so we can abort later if needed.
-                // The item comes from the streaming response, therefore it has
-                // either `id` (chat) or `call_id` (responses) – we normalise
-                // by reading both.
-                const callId =
-                  (item as { call_id?: string; id?: string }).call_id ??
-                  (item as { id?: string }).id;
-                if (callId) {
-                  this.pendingAborts.add(callId);
+            // Handle chat completions chunks
+            if (chunk.choices && chunk.choices.length > 0) {
+              const choice = chunk.choices[0];
+              if (!choice) continue;
+              
+              // Handle text content from the assistant
+              if (choice.delta && choice.delta.content) {
+                const textContent = choice.delta.content;
+                
+                // Accumulate text in the buffer
+                textBuffer += textContent;
+                
+                // Flush the buffer if we have a natural break or enough content
+                // This helps group text into more natural chunks rather than single words
+                if (
+                  // Natural breaks in text
+                  (textBuffer.endsWith(". ") || 
+                  textBuffer.endsWith(".\n") || 
+                  textBuffer.endsWith("? ") ||
+                  textBuffer.endsWith("?\n") ||
+                  textBuffer.endsWith("! ") ||
+                  textBuffer.endsWith("!\n") ||
+                  textBuffer.endsWith("\n\n")) &&
+                  // Ensure minimum time between flushes for smoother output
+                  Date.now() - lastFlushTime > 150 ||
+                  // Always flush if we have a lot of content
+                  textBuffer.length > 120
+                ) {
+                  flushTextBuffer();
                 }
-              } else {
-                stageItem(item as ResponseItem);
               }
-            }
+              
+              // Handle tool calls (functions)
+              else if (choice.delta?.tool_calls && choice.delta.tool_calls.length > 0) {
+                // If we have any buffered text, flush it before processing the tool call
+                if (textBuffer.length > 0) {
+                  flushTextBuffer();
+                }
+                
+                for (const toolCall of choice.delta.tool_calls) {
+                  if (toolCall.function) {
+                    const callId = toolCall.id || `func-${Date.now()}-${Math.random().toString().substring(2, 8)}`;
+                    // Create a function call response item
+                    const functionCallItem: any = {
+                      id: callId,
+                      call_id: callId,
+                      type: "function_call",
+                      name: toolCall.function.name || "shell",
+                      arguments: toolCall.function.arguments || "{}"
+                    };
+                    
+                    // Track outstanding tool call
+                    if (functionCallItem.id) {
+                      this.pendingAborts.add(functionCallItem.id);
+                    }
 
-            if (event.type === "response.completed") {
-              if (thisGeneration === this.generation && !this.canceled) {
-                for (const item of event.response.output) {
-                  stageItem(item as ResponseItem);
+                    // Process the function call
+                    const funcResults = await this.handleFunctionCall(functionCallItem);
+                    turnInput.push(...funcResults);
+                  }
                 }
               }
-              if (event.response.status === "completed") {
-                // TODO: remove this once we can depend on streaming events
-                const newTurnInput = await this.processEventsWithoutStreaming(
-                  event.response.output,
-                  stageItem,
-                );
-                turnInput = newTurnInput;
+              
+              // Handle finish reason
+              if (choice.finish_reason) {
+                // Flush any remaining text in the buffer
+                if (textBuffer.length > 0) {
+                  flushTextBuffer();
+                }
+                
+                if (isLoggingEnabled()) {
+                  log(`AgentLoop.run(): completion finished with reason: ${choice.finish_reason}`);
+                }
+                // Update last response ID
+                if (chunk.id) {
+                  lastResponseId = chunk.id;
+                  this.onLastResponseId(chunk.id);
+                }
               }
-              lastResponseId = event.response.id;
-              this.onLastResponseId(event.response.id);
             }
           }
         } catch (err: unknown) {
@@ -793,6 +890,10 @@ export class AgentLoop {
           }
           throw err;
         } finally {
+          // Make sure we flush any remaining text in the buffer
+          if (textBuffer.length > 0) {
+            flushTextBuffer();
+          }
           this.currentStream = null;
         }
 
@@ -974,7 +1075,7 @@ export class AgentLoop {
       if (isNetworkOrServerError) {
         try {
           const msgText =
-            "⚠️  Network error while contacting OpenAI. Please check your connection and try again.";
+            "⚠️  Network error while contacting DeepSeek. Please check your connection and try again.";
           this.onItem({
             id: `error-${Date.now()}`,
             type: "message",
@@ -1039,7 +1140,7 @@ export class AgentLoop {
             }`,
           ].join(", ");
 
-          const msgText = `⚠️  OpenAI rejected the request${
+          const msgText = `⚠️  DeepSeek rejected the request${
             reqId ? ` (request ID: ${reqId})` : ""
           }. Error details: ${errorDetails}. Please verify your settings and try again.`;
 
@@ -1064,6 +1165,127 @@ export class AgentLoop {
       // Re‑throw all other errors so upstream handlers can decide what to do.
       throw err;
     }
+  }
+
+  /**
+   * Convert ResponseInputItems to the message format expected by the chat completions API
+   */
+  private convertInputToMessages(
+    inputItems: Array<ResponseInputItem>,
+    systemPrompt: string
+  ): Array<any> {
+    const messages: Array<any> = [
+      {
+        role: "system",
+        content: systemPrompt
+      }
+    ];
+
+    // Track last assistant message with tool calls for proper sequencing
+    let lastAssistantWithToolCalls: any = null;
+    const pendingToolResponses: Record<string, string> = {};
+
+    // First pass: process messages and identify tool calls/responses
+    for (const item of inputItems) {
+      if (item.type === "function_call_output") {
+        // Store pending tool response
+        pendingToolResponses[item.call_id] = item.output;
+        continue;
+      }
+
+      if (item.type === "message") {
+        // Convert message items to chat format
+        let content: string | Array<any> = "";
+        
+        if ("content" in item && Array.isArray(item.content)) {
+          // Handle text and image content
+          const contentParts: Array<any> = [];
+          
+          for (const c of item.content) {
+            if (c.type === "input_text" || c.type === "output_text") {
+              if (contentParts.length > 0 && typeof contentParts[contentParts.length - 1] === "string") {
+                // Append to existing text content
+                contentParts[contentParts.length - 1] += c.text;
+              } else {
+                contentParts.push(c.text);
+              }
+            } else if (c.type === "input_image") {
+              // Handle image content safely
+              contentParts.push({
+                type: "image_url",
+                image_url: {
+                  url: (c as any).image_url?.url || "",
+                }
+              });
+            }
+          }
+          
+          // If we only have a single text item, simplify to string
+          if (contentParts.length === 1 && typeof contentParts[0] === "string") {
+            content = contentParts[0];
+          } else if (contentParts.length > 0) {
+            content = contentParts;
+          } else {
+            continue; // Skip empty messages
+          }
+        } else {
+          continue; // Skip invalid messages
+        }
+        
+        // Add the message
+        messages.push({
+          role: item.role === "assistant" ? "assistant" : 
+                item.role === "system" ? "system" : "user",
+          content: content
+        });
+      } else if (item.type === "function_call") {
+        // Add assistant message with tool calls
+        const callId = item.id || `call-${Date.now()}`;
+        
+        // Create assistant message with tool calls
+        const assistantMsg = {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: callId,
+            type: "function",
+            function: {
+              name: item.name || "shell",
+              arguments: item.arguments || "{}"
+            }
+          }]
+        };
+        
+        messages.push(assistantMsg);
+        lastAssistantWithToolCalls = assistantMsg;
+        
+        // If we already have a response for this call, add it immediately after
+        if (pendingToolResponses[callId]) {
+          messages.push({
+            role: "tool",
+            tool_call_id: callId,
+            content: pendingToolResponses[callId]
+          });
+          delete pendingToolResponses[callId];
+        }
+      }
+    }
+    
+    // Add any remaining tool responses that match existing tool calls
+    if (lastAssistantWithToolCalls && lastAssistantWithToolCalls.tool_calls) {
+      for (const toolCall of lastAssistantWithToolCalls.tool_calls) {
+        const callId = toolCall.id;
+        if (pendingToolResponses[callId]) {
+          messages.push({
+            role: "tool",
+            tool_call_id: callId,
+            content: pendingToolResponses[callId]
+          });
+        }
+      }
+    }
+
+    return messages;
   }
 
   // we need until we can depend on streaming events
